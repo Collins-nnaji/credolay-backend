@@ -8,6 +8,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 import json
+import re
 
 # Load environment variables
 load_dotenv()
@@ -67,6 +68,46 @@ def retry_with_backoff(retries=3, backoff_in_seconds=1):
         return wrapper
     return decorator
 
+def extract_json(text):
+    """Attempt to extract JSON from text, even if it's not perfectly formatted."""
+    try:
+        # Try to find JSON-like content
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            # Try to parse it as JSON
+            return json.loads(json_str)
+    except:
+        pass
+    return None
+
+def salvage_data(content):
+    """Attempt to salvage data from non-JSON content."""
+    data = {}
+    
+    # Try to extract match score
+    match = re.search(r'Job Match Score:?\s*(\d+(?:\.\d+)?)%', content)
+    if match:
+        data['matchScore'] = float(match.group(1))
+    
+    # Try to extract skills
+    skills_section = re.search(r'Skills Analysis:(.*?)(?:Recommendations:|$)', content, re.DOTALL)
+    if skills_section:
+        skills = re.findall(r'(\w+(?:\s+\w+)*)\s*(?:\(match\)|\(gap\))', skills_section.group(1))
+        data['skills'] = [{"name": skill, "match": "match" in line} for skill, line in zip(skills, skills_section.group(1).split('\n')) if skill]
+    
+    # Try to extract recommendations
+    recommendations_section = re.search(r'Recommendations:(.*?)(?:Suggested Job Titles:|$)', content, re.DOTALL)
+    if recommendations_section:
+        data['recommendations'] = [rec.strip() for rec in recommendations_section.group(1).split('\n') if rec.strip()]
+    
+    # Try to extract suggested job titles
+    job_titles_section = re.search(r'Suggested Job Titles:(.*?)$', content, re.DOTALL)
+    if job_titles_section:
+        data['suggestedJobTitles'] = [title.strip() for title in job_titles_section.group(1).split('\n') if title.strip()]
+    
+    return data
+
 @app.route('/')
 def home():
     return "Welcome to the CV Analysis API. The backend is running correctly!"
@@ -84,7 +125,7 @@ def analyze():
             return jsonify({"error": "Please provide both CV text and job description."}), 400
 
         messages = [
-            {"role": "system", "content": "You are an AI assistant that helps analyze CVs for job fit and skills."},
+            {"role": "system", "content": "You are an AI assistant that helps analyze CVs for job fit and skills. Always respond in valid JSON format."},
             {"role": "user", "content": f"""
                 Analyze the following CV and job description:
 
@@ -107,19 +148,57 @@ def analyze():
             """}
         ]
 
-        response = client.chat.completions.create(
+        full_response = ""
+        for response in client.chat.completions.create(
             model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             messages=messages,
-            max_tokens=800,
-            timeout=30  # 30 seconds timeout
-        )
+            max_tokens=2000,
+            temperature=0.7,
+            timeout=120,
+            stream=True
+        ):
+            if response.choices[0].delta.content is not None:
+                full_response += response.choices[0].delta.content
 
-        analysis = json.loads(response.choices[0].message.content)
+        # Log the full response for debugging
+        logging.info(f"Full API response: {full_response}")
+
+        # Attempt to parse the JSON content
+        try:
+            analysis = json.loads(full_response)
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON parsing error: {str(e)}")
+            logging.error(f"Problematic content: {full_response}")
+            
+            # Attempt to extract JSON or salvage data
+            extracted_json = extract_json(full_response)
+            if extracted_json:
+                analysis = extracted_json
+            else:
+                analysis = salvage_data(full_response)
+            
+            if not analysis:
+                return jsonify({
+                    "error": "Error parsing AI response. Please try again.",
+                    "rawContent": full_response  # Include the raw content for debugging
+                }), 500
+
+        # Validate the parsed data
+        required_keys = ["matchScore", "skills", "recommendations", "suggestedJobTitles"]
+        missing_keys = [key for key in required_keys if key not in analysis]
+        
+        if missing_keys:
+            logging.error(f"Missing keys in parsed data: {missing_keys}")
+            return jsonify({
+                "error": f"Incomplete data received. Missing: {', '.join(missing_keys)}. Please try again.",
+                "partialData": analysis
+            }), 500
+
         return jsonify(analysis)
 
     except Exception as e:
         logging.error(f"An error occurred during analysis: {str(e)}")
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        return jsonify({"error": f"An error occurred: {str(e)}. Please try again later."}), 500
 
 @app.route('/api/optimize', methods=['POST'])
 @rate_limited(RATE_LIMIT, RATE_LIMIT_PERIOD)
@@ -135,7 +214,7 @@ def optimize():
             return jsonify({"error": "Please provide CV text, job description, and analysis results."}), 400
 
         messages = [
-            {"role": "system", "content": "You are an AI assistant that helps optimize CVs for specific job descriptions."},
+            {"role": "system", "content": "You are an AI assistant that helps optimize CVs for specific job descriptions. Always respond in valid JSON format."},
             {"role": "user", "content": f"""
                 Given the following CV, job description, and analysis:
 
@@ -158,19 +237,51 @@ def optimize():
             """}
         ]
 
-        response = client.chat.completions.create(
+        full_response = ""
+        for response in client.chat.completions.create(
             model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             messages=messages,
-            max_tokens=1500,
-            timeout=30  # 30 seconds timeout
-        )
+            max_tokens=2000,
+            temperature=0.7,
+            timeout=120,
+            stream=True
+        ):
+            if response.choices[0].delta.content is not None:
+                full_response += response.choices[0].delta.content
 
-        optimized_resume = json.loads(response.choices[0].message.content)
+        # Log the full response for debugging
+        logging.info(f"Full API response: {full_response}")
+
+        # Attempt to parse the JSON content
+        try:
+            optimized_resume = json.loads(full_response)
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON parsing error: {str(e)}")
+            logging.error(f"Problematic content: {full_response}")
+            
+            # Attempt to extract JSON
+            extracted_json = extract_json(full_response)
+            if extracted_json:
+                optimized_resume = extracted_json
+            else:
+                return jsonify({
+                    "error": "Error parsing AI response for CV optimization. Please try again.",
+                    "rawContent": full_response  # Include the raw content for debugging
+                }), 500
+
+        # Validate the parsed JSON
+        if "optimizedResume" not in optimized_resume:
+            logging.error("Missing 'optimizedResume' key in parsed JSON")
+            return jsonify({
+                "error": "Incomplete data received. Missing optimized resume. Please try again.",
+                "partialData": optimized_resume
+            }), 500
+
         return jsonify(optimized_resume)
 
     except Exception as e:
         logging.error(f"An error occurred during CV optimization: {str(e)}")
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        return jsonify({"error": f"An error occurred: {str(e)}. Please try again later."}), 500
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
