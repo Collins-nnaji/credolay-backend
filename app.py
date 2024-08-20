@@ -1,14 +1,20 @@
+# app.py
+
 import os
 import time
 import random
 import logging
 from functools import wraps
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 import json
 import re
+import io
+from PyPDF2 import PdfReader
+from docx import Document
+from werkzeug.utils import secure_filename
 
 # Load environment variables
 load_dotenv()
@@ -108,6 +114,23 @@ def salvage_data(content):
     
     return data
 
+def extract_text_from_file(file):
+    filename = secure_filename(file.filename)
+    file_extension = os.path.splitext(filename)[1].lower()
+    
+    if file_extension == '.pdf':
+        pdf_reader = PdfReader(io.BytesIO(file.read()))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+    elif file_extension in ['.doc', '.docx']:
+        doc = Document(io.BytesIO(file.read()))
+        text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+    else:
+        raise ValueError("Unsupported file format")
+    
+    return text
+
 @app.route('/')
 def home():
     return "Welcome to the CV Analysis API. The backend is running correctly!"
@@ -117,12 +140,17 @@ def home():
 @retry_with_backoff()
 def analyze():
     try:
-        data = request.json
-        resume_text = data.get('resumeText')
-        job_description = data.get('jobDescription')
+        if 'resume' not in request.files:
+            return jsonify({"error": "No file part"}), 400
+        file = request.files['resume']
+        if file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+        
+        job_description = request.form.get('jobDescription')
+        if not job_description:
+            return jsonify({"error": "Please provide a job description."}), 400
 
-        if not resume_text or not job_description:
-            return jsonify({"error": "Please provide both CV text and job description."}), 400
+        resume_text = extract_text_from_file(file)
 
         messages = [
             {"role": "system", "content": "You are an AI assistant that helps analyze CVs for job fit and skills. Always respond in valid JSON format."},
@@ -277,7 +305,18 @@ def optimize():
                 "partialData": optimized_resume
             }), 500
 
-        return jsonify(optimized_resume)
+        # Create a text file and send it as an attachment
+        optimized_resume_text = optimized_resume['optimizedResume']
+        buffer = io.BytesIO()
+        buffer.write(optimized_resume_text.encode('utf-8'))
+        buffer.seek(0)
+        
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name='optimized_resume.txt',
+            mimetype='text/plain'
+        )
 
     except Exception as e:
         logging.error(f"An error occurred during CV optimization: {str(e)}")
