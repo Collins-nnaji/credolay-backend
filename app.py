@@ -15,6 +15,10 @@ import io
 from PyPDF2 import PdfReader
 from docx import Document
 from werkzeug.utils import secure_filename
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER
 
 # Load environment variables
 load_dotenv()
@@ -230,7 +234,7 @@ def analyze():
 
 @app.route('/api/optimize', methods=['POST'])
 @rate_limited(RATE_LIMIT, RATE_LIMIT_PERIOD)
-@retry_with_backoff()
+@retry_with_backoff(retries=5, backoff_in_seconds=2)
 def optimize():
     try:
         data = request.json
@@ -242,7 +246,7 @@ def optimize():
             return jsonify({"error": "Please provide CV text, job description, and analysis results."}), 400
 
         messages = [
-            {"role": "system", "content": "You are an AI assistant that helps optimize CVs for specific job descriptions. Always respond in valid JSON format."},
+            {"role": "system", "content": "You are an AI assistant that helps optimize CVs for specific job descriptions. Provide the optimized CV in a clear, structured format with sections."},
             {"role": "user", "content": f"""
                 Given the following CV, job description, and analysis:
 
@@ -257,11 +261,32 @@ def optimize():
                 4. Reorganize the CV structure if necessary to emphasize relevant experiences
 
                 Provide the optimized CV in a clear, professional format without the person's name or fictional name.
-                
-                Format the response as a JSON object with the following structure:
-                {{
-                  "optimizedResume": string
-                }}
+                Use the following structure, with each section clearly labeled:
+
+                [PROFESSIONAL SUMMARY]
+                A brief, impactful summary of the candidate's key qualifications and experience
+
+                [SKILLS]
+                • Skill 1
+                • Skill 2
+                • Skill 3
+                ...
+
+                [WORK EXPERIENCE]
+                Job Title, Company Name (Start Date - End Date)
+                • Key responsibility or achievement
+                • Another key responsibility or achievement
+                ...
+
+                [EDUCATION]
+                Degree, Institution (Year of Graduation)
+
+                [CERTIFICATIONS]
+                • Certification 1
+                • Certification 2
+                ...
+
+                Ensure each section is clearly labeled with square brackets [LIKE THIS].
             """}
         ]
 
@@ -271,7 +296,7 @@ def optimize():
             messages=messages,
             max_tokens=2000,
             temperature=0.7,
-            timeout=120,
+            timeout=180,
             stream=True
         ):
             if response.choices[0].delta.content is not None:
@@ -280,42 +305,58 @@ def optimize():
         # Log the full response for debugging
         logging.info(f"Full API response: {full_response}")
 
-        # Attempt to parse the JSON content
-        try:
-            optimized_resume = json.loads(full_response)
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON parsing error: {str(e)}")
-            logging.error(f"Problematic content: {full_response}")
-            
-            # Attempt to extract JSON
-            extracted_json = extract_json(full_response)
-            if extracted_json:
-                optimized_resume = extracted_json
-            else:
-                return jsonify({
-                    "error": "Error parsing AI response for CV optimization. Please try again.",
-                    "rawContent": full_response  # Include the raw content for debugging
-                }), 500
-
-        # Validate the parsed JSON
-        if "optimizedResume" not in optimized_resume:
-            logging.error("Missing 'optimizedResume' key in parsed JSON")
-            return jsonify({
-                "error": "Incomplete data received. Missing optimized resume. Please try again.",
-                "partialData": optimized_resume
-            }), 500
-
-        # Create a text file and send it as an attachment
-        optimized_resume_text = optimized_resume['optimizedResume']
+        # Create a PDF
         buffer = io.BytesIO()
-        buffer.write(optimized_resume_text.encode('utf-8'))
+        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=72, leftMargin=72, topMargin=72, bottomMargin=18)
+
+        styles = getSampleStyleSheet()
+        styles.add(ParagraphStyle(name='Justify', alignment=TA_JUSTIFY))
+        styles.add(ParagraphStyle(name='Left', alignment=TA_LEFT))
+        styles.add(ParagraphStyle(name='Center', alignment=TA_CENTER))
+        styles.add(ParagraphStyle(name='Heading', fontSize=14, spaceAfter=6))
+        styles.add(ParagraphStyle(name='Bullet', leftIndent=20, spaceBefore=0, spaceAfter=0))
+
+        story = []
+
+        # Split the response into sections
+        sections = re.split(r'\[([^\]]+)\]', full_response)
+
+        for i in range(1, len(sections), 2):
+            if i < len(sections):
+                title = sections[i].strip()
+                content = sections[i+1].strip() if i+1 < len(sections) else ""
+
+                story.append(Paragraph(title, styles['Heading']))
+                
+                if title == "SKILLS" or title == "CERTIFICATIONS":
+                    for item in content.split('•'):
+                        if item.strip():
+                            story.append(Paragraph(f"• {item.strip()}", styles['Bullet']))
+                elif title == "WORK EXPERIENCE":
+                    experiences = content.split('\n\n')
+                    for exp in experiences:
+                        lines = exp.split('\n')
+                        story.append(Paragraph(lines[0], styles['Left']))
+                        for line in lines[1:]:
+                            if line.strip().startswith('•'):
+                                story.append(Paragraph(line.strip(), styles['Bullet']))
+                            else:
+                                story.append(Paragraph(line.strip(), styles['Left']))
+                else:
+                    for para in content.split('\n'):
+                        if para.strip():
+                            story.append(Paragraph(para.strip(), styles['Justify']))
+                
+                story.append(Spacer(1, 12))
+
+        doc.build(story)
         buffer.seek(0)
-        
+
         return send_file(
             buffer,
             as_attachment=True,
-            download_name='optimized_resume.txt',
-            mimetype='text/plain'
+            download_name='optimized_resume.pdf',
+            mimetype='application/pdf'
         )
 
     except Exception as e:
