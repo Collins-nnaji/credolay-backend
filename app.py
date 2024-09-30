@@ -22,7 +22,8 @@ app = Flask(__name__)
 # Configure CORS
 allowed_origins = [
     'https://credolay.com',
-    'https://credolay-eydvckgkcmbycsdg.eastus-01.azurewebsites.net'
+    'https://credolay.netlify.app'
+    'https://www.credolay.netlify.app'
 ]
 CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
@@ -94,21 +95,45 @@ def salvage_data(content):
     if match:
         data['matchScore'] = float(match.group(1))
     
+    # Try to extract match score explanation
+    match = re.search(r'Match Score Explanation:(.*?)(?:Skills Analysis:|$)', content, re.DOTALL)
+    if match:
+        data['matchScoreExplanation'] = match.group(1).strip()
+    
     # Try to extract skills
-    skills_section = re.search(r'Skills Analysis:(.*?)(?:Recommendations:|$)', content, re.DOTALL)
+    skills_section = re.search(r'Skills Analysis:(.*?)(?:Skills Gap Analysis:|$)', content, re.DOTALL)
     if skills_section:
-        skills = re.findall(r'(\w+(?:\s+\w+)*)\s*(?:\(match\)|\(gap\))', skills_section.group(1))
+        skills = re.findall(r'(\w+(?:\s+\w+)*)\s*(?:\(match\)|\(not match\))', skills_section.group(1))
         data['skills'] = [{"name": skill, "match": "match" in line} for skill, line in zip(skills, skills_section.group(1).split('\n')) if skill]
+    
+    # Try to extract skills gap analysis
+    skills_gap_section = re.search(r'Skills Gap Analysis:(.*?)(?:Recommendations:|$)', content, re.DOTALL)
+    if skills_gap_section:
+        data['skillsGapAnalysis'] = skills_gap_section.group(1).strip()
     
     # Try to extract recommendations
     recommendations_section = re.search(r'Recommendations:(.*?)(?:Suggested Job Titles:|$)', content, re.DOTALL)
     if recommendations_section:
-        data['recommendations'] = [rec.strip() for rec in recommendations_section.group(1).split('\n') if rec.strip()]
+        data['recommendations'] = []
+        for rec in recommendations_section.group(1).split('\n'):
+            if ':' in rec:
+                action, time_estimate = rec.split(':', 1)
+                data['recommendations'].append({
+                    "action": action.strip(),
+                    "timeEstimate": time_estimate.strip()
+                })
     
     # Try to extract suggested job titles
     job_titles_section = re.search(r'Suggested Job Titles:(.*?)$', content, re.DOTALL)
     if job_titles_section:
-        data['suggestedJobTitles'] = [title.strip() for title in job_titles_section.group(1).split('\n') if title.strip()]
+        data['suggestedJobTitles'] = []
+        for title in job_titles_section.group(1).split('\n'):
+            if ':' in title:
+                job_title, explanation = title.split(':', 1)
+                data['suggestedJobTitles'].append({
+                    "title": job_title.strip(),
+                    "explanation": explanation.strip()
+                })
     
     return data
 
@@ -160,16 +185,20 @@ def analyze():
 
                 Provide the following information:
                 1. Job Match Score: Give a percentage indicating how well the CV matches the job description.
-                2. Skills Analysis: List the key skills from the job description and indicate whether they are present in the CV (match) or missing (gap).
-                3. Recommendations: Suggest specific actions or skills the candidate should acquire to better fit the job.
-                4. Suggested Job Titles: Propose three job titles the candidate would be well suited for based on their current CV.
+                2. Match Score Explanation: Provide a short paragraph explaining the reasons for the given match score.
+                3. Skills Analysis: List the key skills from the job description and indicate whether they are present in the CV (match) or missing (not match).
+                4. Skills Gap Analysis: For skills that are not matched, provide a brief explanation of each skill and its importance.
+                5. Recommendations: Suggest specific actions or skills the candidate should acquire to better fit the job. Include realistic time estimates for learning each skill based on the candidate's current skill level.
+                6. Suggested Job Titles: Propose three job titles the candidate would be well suited for based on their current CV, along with a brief explanation for each.
 
                 Format the response as a JSON object with the following structure:
                 {{
                   "matchScore": number,
+                  "matchScoreExplanation": string,
                   "skills": [{{ "name": string, "match": boolean }}],
-                  "recommendations": [string],
-                  "suggestedJobTitles": [string]
+                  "skillsGapAnalysis": string,
+                  "recommendations": [{{ "action": string, "timeEstimate": string }}],
+                  "suggestedJobTitles": [{{ "title": string, "explanation": string }}]
                 }}
             """}
         ]
@@ -210,7 +239,7 @@ def analyze():
                 }), 500
 
         # Validate the parsed data
-        required_keys = ["matchScore", "skills", "recommendations", "suggestedJobTitles"]
+        required_keys = ["matchScore", "matchScoreExplanation", "skills", "skillsGapAnalysis", "recommendations", "suggestedJobTitles"]
         missing_keys = [key for key in required_keys if key not in analysis]
         
         if missing_keys:
@@ -248,17 +277,20 @@ def optimize():
                 Job Description: {job_description}
                 Analysis: {json.dumps(analysis)}
 
-                Please optimize the CV to better match the job description. Focus on the following:
+                Please provide tips to optimize the CV to better match the job description. Focus on the following:
                 1. Highlight skills that match the job description
-                2. Add any missing key skills if the candidate possesses them
-                3. Reword experiences to better align with the job requirements
-                4. Reorganize the CV structure if necessary to emphasize relevant experiences
+                2. Suggest how to address skill gaps
+                3. Recommend ways to reword experiences to better align with the job requirements
+                4. Suggest improvements to the CV structure to emphasize relevant experiences
 
-                Provide the optimized CV in a clear, professional format without the person's name or fictional name.
-                
                 Format the response as a JSON object with the following structure:
                 {{
-                  "optimizedResume": string
+                  "optimizationTips": [
+                    {{
+                      "category": string,
+                      "tips": [string]
+                    }}
+                  ]
                 }}
             """}
         ]
@@ -280,7 +312,7 @@ def optimize():
 
         # Attempt to parse the JSON content
         try:
-            optimized_resume = json.loads(full_response)
+            optimization_tips = json.loads(full_response)
         except json.JSONDecodeError as e:
             logging.error(f"JSON parsing error: {str(e)}")
             logging.error(f"Problematic content: {full_response}")
@@ -288,33 +320,22 @@ def optimize():
             # Attempt to extract JSON
             extracted_json = extract_json(full_response)
             if extracted_json:
-                optimized_resume = extracted_json
+                optimization_tips = extracted_json
             else:
                 return jsonify({
-                    "error": "Error parsing AI response for CV optimization. Please try again.",
+                    "error": "Error parsing AI response for CV optimization tips. Please try again.",
                     "rawContent": full_response  # Include the raw content for debugging
                 }), 500
 
         # Validate the parsed JSON
-        if "optimizedResume" not in optimized_resume:
-            logging.error("Missing 'optimizedResume' key in parsed JSON")
+        if "optimizationTips" not in optimization_tips:
+            logging.error("Missing 'optimizationTips' key in parsed JSON")
             return jsonify({
-                "error": "Incomplete data received. Missing optimized resume. Please try again.",
-                "partialData": optimized_resume
+                "error": "Incomplete data received. Missing optimization tips. Please try again.",
+                "partialData": optimization_tips
             }), 500
 
-        # Create a text file and send it as an attachment
-        optimized_resume_text = optimized_resume['optimizedResume']
-        buffer = io.BytesIO()
-        buffer.write(optimized_resume_text.encode('utf-8'))
-        buffer.seek(0)
-        
-        return send_file(
-            buffer,
-            as_attachment=True,
-            download_name='optimized_resume.txt',
-            mimetype='text/plain'
-        )
+        return jsonify(optimization_tips)
 
     except Exception as e:
         logging.error(f"An error occurred during CV optimization: {str(e)}")
