@@ -24,6 +24,7 @@ allowed_origins = [
     'https://credolay.com',
     'https://credolay.netlify.app'
     'https://www.credolay.netlify.app'
+    'https://credolay.azurewebsites.net'
 ]
 CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
